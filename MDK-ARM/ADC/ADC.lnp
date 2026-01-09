@@ -24,6 +24,7 @@
 "adc\stm32f1xx_hal_uart.o"
 "adc\system_stm32f1xx.o"
 "adc\retarget.o"
+"adc\monitor_usart.o"
 --library_type=microlib --strict --scatter "ADC\ADC.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers

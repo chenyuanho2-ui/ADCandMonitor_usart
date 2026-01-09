@@ -25,7 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "Monitor_usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,7 +35,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define LED0_PIN GPIO_PIN_13
+#define LED0_GPIO_PORT GPIOC
+#define LED0_ON  HAL_GPIO_WritePin(LED0_GPIO_PORT, LED0_PIN, GPIO_PIN_RESET)  // 假设低电平亮（根据硬件确定）
+#define LED0_OFF HAL_GPIO_WritePin(LED0_GPIO_PORT, LED0_PIN, GPIO_PIN_SET)    // 高电平灭
+#define LED0_TOGGLE HAL_GPIO_TogglePin(LED0_GPIO_PORT, LED0_PIN)  // 翻转状态
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -93,7 +97,8 @@ int main(void)
   MX_USART1_UART_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-
+Monitor_Init();
+LED0_OFF;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -103,6 +108,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  LED0_ON;
+	  Monitor_Task();
   }
   /* USER CODE END 3 */
 }

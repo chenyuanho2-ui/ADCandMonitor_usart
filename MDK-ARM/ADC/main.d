@@ -33,3 +33,4 @@ adc\main.o: ../Core/Inc/adc.h
 adc\main.o: ../Core/Inc/spi.h
 adc\main.o: ../Core/Inc/usart.h
 adc\main.o: ../Core/Inc/gpio.h
+adc\main.o: ../miku666/H/Monitor_usart.h
