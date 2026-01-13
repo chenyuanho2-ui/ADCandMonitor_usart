@@ -107,7 +107,7 @@ void Monitor_Task(void) {
     // 2. 按键检测 (自锁模式)
     uint8_t curr_btn_state = HAL_GPIO_ReadPin(BOTTON1_GPIO_Port, BOTTON1_Pin);
     if (curr_btn_state == GPIO_PIN_RESET && last_btn_state == GPIO_PIN_SET) {
-        HAL_Delay(20); // 消抖
+        HAL_Delay(100); // 消抖
         if (HAL_GPIO_ReadPin(BOTTON1_GPIO_Port, BOTTON1_Pin) == GPIO_PIN_RESET) {
             is_printing = !is_printing;
             char *state_msg = is_printing ? "-> START\r\n" : "-> STOP\r\n";
@@ -124,10 +124,10 @@ void Monitor_Task(void) {
             
             if (temp_received_flag) {
                 // 打印格式：[时间戳] 温度值, ADC值
-                sprintf(msg, "[%lu ms] T:%.1f C, ADC:%u\r\n", 
+                sprintf(msg, "[%u ms] T:%.1f C, ADC:%u\r\n", 
                         next_print_tick, latest_temp_val, median_adc);
             } else {
-                sprintf(msg, "[%lu ms] T:Wait.., ADC:%u\r\n", 
+                sprintf(msg, "[%u ms] T:Wait.., ADC:%u\r\n", 
                         next_print_tick, median_adc);
             }
             HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 50);
