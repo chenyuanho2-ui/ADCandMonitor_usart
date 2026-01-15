@@ -43,10 +43,6 @@ typedef enum {
 static ParseState_t current_state = STATE_WAIT_FC;
 static uint8_t temp_lsb = 0;
 
-// --- LED 定时翻转相关 ---
-static uint32_t next_led_toggle_tick = 0; // 记录下一次 LED 翻转的时间点
-#define LED_TOGGLE_INTERVAL 15000         // 15000毫秒 = 15秒
-
 // --- ADC 滤波与按键相关 ---
 static uint16_t adc_window[ADC_WINDOW_SIZE] = {0};
 static uint8_t adc_win_idx = 0;
@@ -87,9 +83,6 @@ void Monitor_Init(void) {
     uint32_t now = HAL_GetTick();
     last_adc_tick = now;
     next_print_tick = now + PRINT_INTERVAL;
-	
-	// 初始化 LED 计时器
-    next_led_toggle_tick = now + LED_TOGGLE_INTERVAL;
     
     // 预填充 ADC 窗口
     uint16_t initial_val = HAL_ADC_GetValue(&hadc1);
@@ -140,16 +133,6 @@ void Monitor_Task(void) {
             HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 50);
         }
         next_print_tick += PRINT_INTERVAL;
-    }
-	
-	// 4. 新增：LED 每 15 秒翻转逻辑
-    if (now >= next_led_toggle_tick) {
-        // 使用 main.h 中定义的 LED0_TOGGLE 宏
-        // 注意：如果 main.c 的宏没在 main.h 声明，可以直接用 HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-		
-		// 更新下一次触发时间
-        next_led_toggle_tick = now + LED_TOGGLE_INTERVAL;
     }
 }
 
