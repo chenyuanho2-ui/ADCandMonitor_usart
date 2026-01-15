@@ -34,3 +34,4 @@ adc\monitor_usart.o: ../Core/Inc/usart.h
 adc\monitor_usart.o: ../Core/Inc/adc.h
 adc\monitor_usart.o: D:\keil5\ARM\ARMCC\Bin\..\include\stdio.h
 adc\monitor_usart.o: D:\keil5\ARM\ARMCC\Bin\..\include\string.h
+adc\monitor_usart.o: D:\keil5\ARM\ARMCC\Bin\..\include\stdlib.h

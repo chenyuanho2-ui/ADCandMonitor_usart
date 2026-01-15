@@ -1,10 +1,13 @@
 /*
  * Monitor_usart.c
- * 最终修正版：
- * 1. 协议偏移修正：FC [Skip] [Skip] [Skip] [LSB] [MSB]
- * (读取第5、6字节作为温度)
- * 2. 温度计算：Hex / 10.0 = Temp
- * 3. 按键逻辑：PA3 按一下开始，再按一下停止
+ * 2026-01-15 最终修正版
+ * 功能：
+ * 1. 协议解析：FC 0A 00 01 开头，0-100度有效范围过滤。
+ * 2. ADC采样：每50ms采集一次，打印时取0.25s内的中值。
+ * 3. 时序控制：
+ * - 收到第一帧有效温度 -> 同步开始 (Start ADC)。
+ * - 延时0.25s (等待数据积攒) -> 第一次打印 (标记为 0.00s)。
+ * - 之后每0.25s打印一次。
  */
 
 #include "Monitor_usart.h"
@@ -12,196 +15,258 @@
 #include "adc.h"
 #include "stdio.h"
 #include "string.h"
+#include "stdlib.h" // for qsort
 
 // 引用外部句柄
 extern UART_HandleTypeDef huart1;
 extern ADC_HandleTypeDef hadc1;
 
-// ================= 配置参数 =================
-#define PRINT_INTERVAL      250  // 打印间隔：250ms
-#define ADC_SAMPLE_INTERVAL 50   // ADC采样间隔：50ms
-#define ADC_WINDOW_SIZE     5    // 滤波窗口大小
+// ================= 宏定义与配置 =================
+#define PRINT_INTERVAL_MS   250   // 打印周期 250ms
+#define ADC_SAMPLE_MS       50    // ADC采样周期 50ms
+#define LED_TOGGLE_MS       15000 // LED翻转周期 15s
+#define TEMP_MIN            0.0f
+#define TEMP_MAX            100.0f
 
-// ================= 全局变量 =================
-
-// --- 串口协议相关 ---
-#define RX_BUFFER_SIZE 1
-static uint8_t rx_byte;
-static float latest_temp_val = 0.0f;   // 存储解析出的实际温度值(浮点)
-static uint8_t temp_received_flag = 0; // 标记是否收到过有效温度
+// ADC 窗口大小 (250ms / 50ms = 5，预留多一点防止溢出)
+#define MAX_ADC_SAMPLES     10    
 
 // 协议状态机
 typedef enum {
-    STATE_WAIT_FC,      // 等待包头 FC (Byte 1)
-    STATE_SKIP_BYTE_2,  // 跳过 Byte 2
-    STATE_SKIP_BYTE_3,  // 跳过 Byte 3
-    STATE_SKIP_BYTE_4,  // 跳过 Byte 4
-    STATE_READ_T_LSB,   // 读取 Byte 5 (温度低位, 如 4C)
-    STATE_READ_T_MSB    // 读取 Byte 6 (温度高位, 如 01)
-} ParseState_t;
+    STATE_WAIT_FC,       // 等待帧头 FC
+    STATE_CHECK_LEN,     // 检查 0A
+    STATE_CHECK_ZERO,    // 检查 00
+    STATE_CHECK_STATUS,  // 检查 01
+    STATE_READ_DATA      // 读取数据
+} ProtocolState_t;
 
-static ParseState_t current_state = STATE_WAIT_FC;
-static uint8_t temp_lsb = 0;
+// ================= 全局变量 =================
 
-// --- LED 定时翻转相关 ---
-static uint32_t next_led_toggle_tick = 0; // 记录下一次 LED 翻转的时间点
-#define LED_TOGGLE_INTERVAL 15000         // 15000毫秒 = 15秒
+// --- 接收与解析 ---
+static uint8_t rx_byte;
+static ProtocolState_t p_state = STATE_WAIT_FC;
+static uint8_t data_buf[6];      
+static uint8_t data_idx = 0;
 
-// --- ADC 滤波与按键相关 ---
-static uint16_t adc_window[ADC_WINDOW_SIZE] = {0};
-static uint8_t adc_win_idx = 0;
-static uint32_t last_adc_tick = 0;
+// --- 数据资源 (临界区保护) ---
+static volatile float g_latest_valid_temp = 0.0f; 
+static volatile uint8_t g_has_valid_data = 0;     
 
-// 按键控制
-static uint8_t is_printing = 0;         // 打印开关 (0:停, 1:打印)
-static uint8_t last_btn_state = GPIO_PIN_SET; // 上次按键状态
+// --- ADC 相关 ---
+static uint32_t adc_values[MAX_ADC_SAMPLES];
+static uint8_t adc_count = 0;
+static uint32_t next_adc_tick = 0;
 
-// 定时打印
-static uint32_t next_print_tick = 0;
+// --- 系统控制 ---
+static uint8_t is_running = 1;              // 1:Start, 0:Stop
+// static uint8_t last_btn_state;           // 已移除，避免未使用警告
 
-// ================= 内部工具函数 =================
+// --- 时间轴 ---
+static uint8_t time_synced = 0;             // 是否收到第一帧
+static uint32_t time_base_tick = 0;         // 0.00s 对应的时刻
+static uint32_t next_print_tick = 0;        
+static uint32_t next_led_tick = 0;
 
-static uint16_t Get_Median_ADC(void) {
-    uint16_t temp[ADC_WINDOW_SIZE];
-    for(int i=0; i<ADC_WINDOW_SIZE; i++) temp[i] = adc_window[i];
+// ================= 内部辅助函数 =================
+
+// 简单的冒泡排序用于取中值 (数量很少，性能无影响)
+static uint32_t Get_Median_ADC(void) {
+    if (adc_count == 0) return 0;
+    
+    // 复制一份数据以防修改原数组 (虽然还要重置，习惯上复制更安全)
+    uint32_t sorted[MAX_ADC_SAMPLES];
+    uint8_t n = adc_count;
+    for(int i=0; i<n; i++) sorted[i] = adc_values[i];
     
     // 冒泡排序
-    for (int i = 0; i < ADC_WINDOW_SIZE - 1; i++) {
-        for (int j = 0; j < ADC_WINDOW_SIZE - i - 1; j++) {
-            if (temp[j] > temp[j+1]) {
-                uint16_t t = temp[j]; temp[j] = temp[j+1]; temp[j+1] = t;
+    for(int i=0; i<n-1; i++) {
+        for(int j=0; j<n-i-1; j++) {
+            if(sorted[j] > sorted[j+1]) {
+                uint32_t temp = sorted[j];
+                sorted[j] = sorted[j+1];
+                sorted[j+1] = temp;
             }
         }
     }
-    return temp[ADC_WINDOW_SIZE / 2];
+    // 返回中位数
+    return sorted[n/2];
+}
+
+// 更新温度 (中断调用)
+static void Update_Temperature(uint8_t lsb, uint8_t msb) {
+    uint16_t raw = (uint16_t)lsb | ((uint16_t)msb << 8);
+    float val = raw / 10.0f;
+
+    if (val >= TEMP_MIN && val <= TEMP_MAX) {
+        g_latest_valid_temp = val;
+        g_has_valid_data = 1;
+        
+        // 收到系统生命周期内的第一帧有效数据 -> 建立时间轴
+        if (is_running && !time_synced) {
+            time_synced = 1;
+            uint32_t now = HAL_GetTick();
+            
+            // 关键逻辑：用户要求“采集到第二个温度时才算作第0s”
+            // 即：第一个打印时刻标记为 0.00s。
+            // 现在的时刻是 (Frame 1 Arrival)，第一次打印将在 (Frame 1 + 250ms)。
+            // 所以我们将 time_base_tick 设为 (now + 250)。
+            // 这样在 250ms 后打印时，(Tick - time_base) = 0。
+            time_base_tick = now + PRINT_INTERVAL_MS;
+            
+            // 安排下一次打印和ADC采样
+            next_print_tick = now + PRINT_INTERVAL_MS;
+            next_adc_tick = now; // 立即开始采样ADC
+        }
+    }
 }
 
 // ================= 核心接口 =================
 
 void Monitor_Init(void) {
-    // 1. 启动硬件
-    HAL_ADC_Start(&hadc1);
+    // 1. 启动串口接收
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     
-    // 2. 初始化变量
+    // 2. 初始化时间
     uint32_t now = HAL_GetTick();
-    last_adc_tick = now;
-    next_print_tick = now + PRINT_INTERVAL;
-	
-	// 初始化 LED 计时器
-    next_led_toggle_tick = now + LED_TOGGLE_INTERVAL;
+    next_led_tick = now + LED_TOGGLE_MS;
     
-    // 预填充 ADC 窗口
-    uint16_t initial_val = HAL_ADC_GetValue(&hadc1);
-    for(int i=0; i<ADC_WINDOW_SIZE; i++) adc_window[i] = initial_val;
-
-    // 上电提示
-    char *msg = "\r\n[Offset Corrected] Reading 5th & 6th bytes.\r\n";
+    // 3. 提示
+    char *msg = "\r\n[System Ready] Waiting for FC 0A 00 01... (1st valid frame triggers 0s start)\r\n";
     HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
 }
 
-// 主循环任务
 void Monitor_Task(void) {
     uint32_t now = HAL_GetTick();
 
-    // 1. ADC 采样
-    if (now - last_adc_tick >= ADC_SAMPLE_INTERVAL) {
-        last_adc_tick = now;
-        adc_window[adc_win_idx++] = (uint16_t)HAL_ADC_GetValue(&hadc1);
-        if (adc_win_idx >= ADC_WINDOW_SIZE) adc_win_idx = 0;
-    }
-
-    // 2. 按键检测 (自锁模式)
-    uint8_t curr_btn_state = HAL_GPIO_ReadPin(BOTTON1_GPIO_Port, BOTTON1_Pin);
-    if (curr_btn_state == GPIO_PIN_RESET && last_btn_state == GPIO_PIN_SET) {
-        HAL_Delay(100); // 消抖
+    // --- 1. 按键逻辑 (PA3 / BOTTON1) ---
+    // 下拉输入，按下为高电平? 
+    // 原代码逻辑：if(Read == RESET) ... wait while(Read == RESET)
+    // 假设按键按下是低电平(RESET)
+    if (HAL_GPIO_ReadPin(BOTTON1_GPIO_Port, BOTTON1_Pin) == GPIO_PIN_RESET) {
+        HAL_Delay(20); 
         if (HAL_GPIO_ReadPin(BOTTON1_GPIO_Port, BOTTON1_Pin) == GPIO_PIN_RESET) {
-            is_printing = !is_printing;
-            char *state_msg = is_printing ? "-> START\r\n" : "-> STOP\r\n";
-            HAL_UART_Transmit(&huart1, (uint8_t*)state_msg, strlen(state_msg), 100);
-        }
-    }
-    last_btn_state = curr_btn_state;
-
-    // 3. 打印逻辑
-    if (now >= next_print_tick) {
-        if (is_printing) {
-            uint16_t median_adc = Get_Median_ADC();
-            char msg[64];
+            while(HAL_GPIO_ReadPin(BOTTON1_GPIO_Port, BOTTON1_Pin) == GPIO_PIN_RESET); // 等待松开
             
-            if (temp_received_flag) {
-                // 打印格式：[时间戳] 温度值, ADC值
-                sprintf(msg, "[%u ms] T:%.1f C, ADC:%u\r\n", 
-                        next_print_tick, latest_temp_val, median_adc);
+            is_running = !is_running;
+            
+            if (is_running) {
+                // 重启：清除同步标志，等待新数据重建时间轴
+                time_synced = 0; 
+                adc_count = 0;
+                char *s = "-> START\r\n";
+                HAL_UART_Transmit(&huart1, (uint8_t*)s, strlen(s), 50);
             } else {
-                sprintf(msg, "[%u ms] T:Wait.., ADC:%u\r\n", 
-                        next_print_tick, median_adc);
+                char *s = "-> STOP\r\n";
+                HAL_UART_Transmit(&huart1, (uint8_t*)s, strlen(s), 50);
             }
-            HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 50);
         }
-        next_print_tick += PRINT_INTERVAL;
     }
-	
-	// 4. 新增：LED 每 15 秒翻转逻辑
-    if (now >= next_led_toggle_tick) {
-        // 使用 main.h 中定义的 LED0_TOGGLE 宏
-        // 注意：如果 main.c 的宏没在 main.h 声明，可以直接用 HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+    // --- 2. LED 15s 翻转 ---
+    if (now >= next_led_tick) {
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-		
-		// 更新下一次触发时间
-        next_led_toggle_tick = now + LED_TOGGLE_INTERVAL;
+        next_led_tick = now + LED_TOGGLE_MS;
+    }
+    
+    // 只有在运行且已同步(收到过第一帧)后，才执行ADC和打印
+    if (is_running && time_synced) {
+        
+        // --- 3. ADC 采样 (每50ms) ---
+        if (now >= next_adc_tick) {
+            // 启动一次转换
+            HAL_ADC_Start(&hadc1);
+            if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+                uint32_t val = HAL_ADC_GetValue(&hadc1);
+                
+                // 存入缓冲
+                if (adc_count < MAX_ADC_SAMPLES) {
+                    adc_values[adc_count++] = val;
+                }
+            }
+            // 设定下次采样时间
+            next_adc_tick += ADC_SAMPLE_MS;
+            if (next_adc_tick < now) next_adc_tick = now + ADC_SAMPLE_MS;
+        }
+
+        // --- 4. 打印逻辑 (每250ms) ---
+        if (now >= next_print_tick) {
+            
+            // a. 获取温度 (原子操作)
+            float current_temp = 0.0f;
+            uint8_t has_data = 0;
+            __disable_irq();
+            current_temp = g_latest_valid_temp;
+            has_data = g_has_valid_data;
+            __enable_irq();
+
+            if (has_data) {
+                // b. 获取ADC中值
+                uint32_t median_adc = Get_Median_ADC();
+                
+                // c. 计算相对时间 (注意 time_base_tick 已经是 FirstFrameTime + 250ms)
+                // 这样第一次打印时 (now - time_base_tick) ≈ 0
+                // 加上 0.005f 是为了四舍五入显示更加友好，防止出现 -0.00
+                float relative_time = (int32_t)(now - time_base_tick) / 1000.0f; 
+                
+                // d. 打印
+                char msg[64];
+                // 格式: [时间s] T:温度 C, ADC:值
+                sprintf(msg, "[%.2fs] T:%.1f C, ADC:%lu\r\n", 
+                        relative_time, current_temp, median_adc);
+                HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 50);
+                
+                // e. 清空ADC缓冲，准备下一个0.25s周期
+                adc_count = 0;
+            }
+
+            // f. 设定下次打印
+            next_print_tick += PRINT_INTERVAL_MS;
+            if (next_print_tick < now) next_print_tick = now + PRINT_INTERVAL_MS;
+        }
     }
 }
 
-// 串口中断解析
+// 串口中断回调
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
-        // 立即开启下一次接收
         HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
         
-        // 协议解析机：FC [Skip] [Skip] [Skip] [LSB] [MSB]
-        switch (current_state) {
-            case STATE_WAIT_FC:         // Byte 1
-                if (rx_byte == 0xFC) {
-                    current_state = STATE_SKIP_BYTE_2;
+        // FC 0A 00 01 [Byte5 Byte6] ...
+        switch (p_state) {
+            case STATE_WAIT_FC:
+                if (rx_byte == 0xFC) p_state = STATE_CHECK_LEN;
+                break;
+
+            case STATE_CHECK_LEN: // 0A
+                if (rx_byte == 0x0A) p_state = STATE_CHECK_ZERO;
+                else if (rx_byte == 0x05) p_state = STATE_WAIT_FC; // 忽略请求帧
+                else p_state = STATE_WAIT_FC;
+                break;
+
+            case STATE_CHECK_ZERO: // 00
+                if (rx_byte == 0x00) p_state = STATE_CHECK_STATUS;
+                else p_state = STATE_WAIT_FC;
+                break;
+
+            case STATE_CHECK_STATUS: // 01
+                if (rx_byte == 0x01) {
+                    p_state = STATE_READ_DATA;
+                    data_idx = 0;
                 }
+                else p_state = STATE_WAIT_FC;
                 break;
 
-            case STATE_SKIP_BYTE_2:     // Byte 2
-                current_state = STATE_SKIP_BYTE_3;
-                break;
-
-            case STATE_SKIP_BYTE_3:     // Byte 3
-                current_state = STATE_SKIP_BYTE_4;
-                break;
-
-            case STATE_SKIP_BYTE_4:     // Byte 4
-                current_state = STATE_READ_T_LSB;
-                break;
-
-            case STATE_READ_T_LSB:      // Byte 5 (实际数据低位)
-                temp_lsb = rx_byte; 
-                current_state = STATE_READ_T_MSB;
-                break;
-
-            case STATE_READ_T_MSB:      // Byte 6 (实际数据高位)
-                {
-                    uint8_t temp_msb = rx_byte;
-                    
-                    // 合成原始值 (小端: LSB在前)
-                    uint16_t raw_temp = (uint16_t)temp_lsb | ((uint16_t)temp_msb << 8);
-                    
-                    // 校准计算: / 10.0
-                    latest_temp_val = raw_temp / 10.0f;
-                    
-                    temp_received_flag = 1;
-                    
-                    current_state = STATE_WAIT_FC;
+            case STATE_READ_DATA:
+                data_buf[data_idx++] = rx_byte;
+                if (data_idx >= 6) {
+                    // data_buf[0]=LSB, data_buf[1]=MSB
+                    Update_Temperature(data_buf[0], data_buf[1]);
+                    p_state = STATE_WAIT_FC;
                 }
                 break;
                 
             default:
-                current_state = STATE_WAIT_FC;
+                p_state = STATE_WAIT_FC;
                 break;
         }
     }
